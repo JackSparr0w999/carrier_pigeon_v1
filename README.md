@@ -68,5 +68,9 @@ Non appena il device si sarà connesso anche l'admin potrà inviare i messaggi.
 
 _Alcune immagini_
 
+![Immagine 1](screenhots/Home.png)
+![Immagine 2](screenhots/nest_example.png)
+![Immagine 3](screenhots/sendingfiles.png)
+![Immagine 4](screenhots/getinfo_tool.png)
 
 
