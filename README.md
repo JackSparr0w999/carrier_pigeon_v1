@@ -57,3 +57,16 @@ end run
 **Opzione 2**. _Carica tutto su Render.com e crea gratuitamente un link pubblico e accessibile a chiunque_
 
 In questo modo potrai condividere file da un device all'altro anche se essi sono distanti migliaia di chilometri.
+
+
+### How to send files
+Ti basterà creare una stanza privata dove poterti connettere con i tuoi dispositivi.
+
+Con un device crei la stanza inserendo un PIN personalizzato nel box "Create Nest" (oppure no, verrà scelto in automatico), poi con l'altro device accedi a quella stanza scrivendo nel box "join nest", lo stesso codice che hai ottenuto o scritto prima. 
+
+Non appena il device si sarà connesso anche l'admin potrà inviare i messaggi.
+
+_Alcune immagini_
+
+
+
