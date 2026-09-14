@@ -19,25 +19,8 @@ const BLOB_MERGE_EVERY_N_CHUNKS = 200;
 // il trasferimento bloccato e lo annulliamo automaticamente.
 const STALL_TIMEOUT_MS = 20000;
 
-// I chunk vengono inviati come stringa base64 (invece di ArrayBuffer grezzo)
-// per uniformità con i messaggi di testo, che sappiamo funzionare in modo affidabile.
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
 
-function base64ToArrayBuffer(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
+
 
 // FEAT: formatta una dimensione in byte in una stringa leggibile (es. "128 MB"),
 // usata nella tabella mostrata dal pulsante "Get info".
@@ -315,128 +298,104 @@ function AppContent() {
   };
 
   const setupDataChannel = (dc) => {
-    dcRef.current = dc;
+  dcRef.current = dc;
+  dc.binaryType = 'arraybuffer'; // FIX VELOCITÀ: torniamo a ricevere ArrayBuffer diretti
 
-    dc.onopen = () => setConnectionStatus('🟢 Tunnel P2P Diretto Aperto!');
-    dc.onclose = () => setConnectionStatus('🔴 Disconnesso');
+  dc.onopen = () => setConnectionStatus('🟢 Tunnel P2P Diretto Aperto!');
+  dc.onclose = () => setConnectionStatus('🔴 Disconnesso');
 
-    dc.onmessage = (event) => {
-      let data;
-      try {
-        data = JSON.parse(event.data);
-      } catch (err) {
-        console.error('Errore lettura dati:', err);
-        return;
+  dc.onmessage = (event) => {
+    // FIX VELOCITÀ: i chunk arrivano come ArrayBuffer, non più come JSON+base64
+    if (event.data instanceof ArrayBuffer) {
+      if (!incomingFileInfo.current) return;
+
+      receiveBuffer.current.push(new Blob([event.data]));
+      receivedSize.current += event.data.byteLength;
+      chunkCountRef.current += 1;
+
+      if (chunkCountRef.current % BLOB_MERGE_EVERY_N_CHUNKS === 0) {
+        receiveBuffer.current = [new Blob(receiveBuffer.current)];
       }
 
-      if (data.type === 'file-meta') {
-        // FIX: validiamo i campi prima di fidarcene.
-        const size = Number(data.size);
-        const name = typeof data.name === 'string' && data.name.trim()
-          ? data.name.trim().slice(0, 255)
-          : 'file_sconosciuto';
+      const { batchId, batchIndex, batchTotal } = incomingFileInfo.current;
+      const progress = Math.round((receivedSize.current / incomingFileInfo.current.size) * 100);
 
-        if (!Number.isFinite(size) || size < 0 || size > MAX_FILE_SIZE) {
-          console.warn('file-meta non valido, ignorato:', data);
-          return;
-        }
-
-        // FEAT: campi opzionali di raggruppamento per l'invio di più file insieme.
-        const batchId = typeof data.batchId === 'string' ? data.batchId : null;
-        const batchIndex = Number.isInteger(data.batchIndex) ? data.batchIndex : null;
-        const batchTotal = Number.isInteger(data.batchTotal) && data.batchTotal > 0 ? data.batchTotal : null;
-
-        incomingFileInfo.current = { ...data, size, name, batchId, batchIndex, batchTotal };
-        receiveBuffer.current = [];
-        receivedSize.current = 0;
-        lastProgressRef.current = 0;
-        chunkCountRef.current = 0;
+      if (Number.isFinite(progress) && (progress > lastProgressRef.current || receivedSize.current >= incomingFileInfo.current.size)) {
+        lastProgressRef.current = progress;
         setTransferProgress(
-          batchTotal ? `Ricezione ${batchIndex + 1}/${batchTotal}: 0%` : 'Ricezione: 0%'
+          batchTotal ? `Ricezione ${batchIndex + 1}/${batchTotal}: ${progress}%` : `Ricezione: ${progress}%`
         );
         armStallWatchdog();
-        return;
       }
 
-      if (data.type === 'file-chunk') {
-        if (!incomingFileInfo.current) return;
-        if (typeof data.data !== 'string') return;
+      if (receivedSize.current >= incomingFileInfo.current.size) {
+        const blob = new Blob(receiveBuffer.current);
+        const url = URL.createObjectURL(blob);
+        const fileName = incomingFileInfo.current.name;
+        const fileSender = incomingFileInfo.current.sender;
+        const fileSize = incomingFileInfo.current.size;
 
-        let buffer;
-        try {
-          buffer = base64ToArrayBuffer(data.data);
-        } catch (err) {
-          console.error('Chunk base64 non valido, scartato:', err);
+        resetTransferState();
+
+        if (batchId && batchTotal) {
+          const batch = pendingBatchesRef.current[batchId] || { files: [], total: batchTotal, sender: fileSender };
+          batch.files.push({ name: fileName, url, size: fileSize });
+          pendingBatchesRef.current[batchId] = batch;
+          if (batch.files.length >= batch.total) {
+            delete pendingBatchesRef.current[batchId];
+            setMessages(prev => [...prev, { sender: batch.sender, batch: true, files: batch.files }]);
+          }
           return;
         }
 
-        receiveBuffer.current.push(new Blob([buffer]));
-        receivedSize.current += buffer.byteLength;
-        chunkCountRef.current += 1;
+        setMessages(prev => [...prev, { sender: fileSender, text: `File ricevuto: ${fileName}`, fileUrl: url, fileName }]);
+      }
+      return;
+    }
 
-        if (chunkCountRef.current % BLOB_MERGE_EVERY_N_CHUNKS === 0) {
-          receiveBuffer.current = [new Blob(receiveBuffer.current)];
-        }
+    // Testo: file-meta o messaggio di chat (invariato)
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (err) {
+      console.error('Errore lettura dati:', err);
+      return;
+    }
 
-        const { batchId, batchIndex, batchTotal } = incomingFileInfo.current;
-        const progress = Math.round((receivedSize.current / incomingFileInfo.current.size) * 100);
+    if (data.type === 'file-meta') {
+      // ... (blocco invariato, lascialo come già lo hai)
+      const size = Number(data.size);
+      const name = typeof data.name === 'string' && data.name.trim()
+        ? data.name.trim().slice(0, 255)
+        : 'file_sconosciuto';
 
-        if (Number.isFinite(progress) && (progress > lastProgressRef.current || receivedSize.current >= incomingFileInfo.current.size)) {
-          lastProgressRef.current = progress;
-          setTransferProgress(
-            batchTotal ? `Ricezione ${batchIndex + 1}/${batchTotal}: ${progress}%` : `Ricezione: ${progress}%`
-          );
-          armStallWatchdog();
-        }
-
-        if (receivedSize.current >= incomingFileInfo.current.size) {
-          const blob = new Blob(receiveBuffer.current);
-          const url = URL.createObjectURL(blob);
-
-          // FIX CRITICO: salviamo i valori PRIMA di azzerare lo stato.
-          // Il bug era: `setMessages(prev => [...])` legge `incomingFileInfo.current`
-          // in modo differito (l'updater non è eseguito subito da React), mentre
-          // `resetTransferState()` lo azzerava a null in modo sincrono subito dopo.
-          // Risultato: `null.sender` -> eccezione non gestita -> React smonta
-          // l'albero -> schermata nera (lo sfondo dell'app è nero).
-          const fileName = incomingFileInfo.current.name;
-          const fileSender = incomingFileInfo.current.sender;
-          const fileSize = incomingFileInfo.current.size; // FEAT: serve per la tabella di "Get info"
-
-          resetTransferState();
-
-          // FEAT: se il file fa parte di un invio multiplo, lo accumuliamo nel
-          // batch invece di creare subito un messaggio; il messaggio unico
-          // (con tutti i file raggruppati) viene creato solo quando l'ultimo
-          // file del gruppo è arrivato.
-          if (batchId && batchTotal) {
-            const batch = pendingBatchesRef.current[batchId] || { files: [], total: batchTotal, sender: fileSender };
-            batch.files.push({ name: fileName, url, size: fileSize });
-            pendingBatchesRef.current[batchId] = batch;
-
-            if (batch.files.length >= batch.total) {
-              delete pendingBatchesRef.current[batchId];
-              setMessages(prev => [...prev, { sender: batch.sender, batch: true, files: batch.files }]);
-            }
-            return;
-          }
-
-          setMessages(prev => [...prev, {
-            sender: fileSender,
-            text: `File ricevuto: ${fileName}`,
-            fileUrl: url,
-            fileName: fileName
-          }]);
-        }
+      if (!Number.isFinite(size) || size < 0 || size > MAX_FILE_SIZE) {
+        console.warn('file-meta non valido, ignorato:', data);
         return;
       }
 
-      // Messaggio di chat normale
-      if (typeof data.text === 'string') {
-        setMessages(prev => [...prev, { sender: data.sender, text: data.text }]);
-      }
-    };
+      // FEAT: campi opzionali di raggruppamento per l'invio di più file insieme.
+      const batchId = typeof data.batchId === 'string' ? data.batchId : null;
+      const batchIndex = Number.isInteger(data.batchIndex) ? data.batchIndex : null;
+      const batchTotal = Number.isInteger(data.batchTotal) && data.batchTotal > 0 ? data.batchTotal : null;
+
+      incomingFileInfo.current = { ...data, size, name, batchId, batchIndex, batchTotal };
+      receiveBuffer.current = [];
+      receivedSize.current = 0;
+      lastProgressRef.current = 0;
+      chunkCountRef.current = 0;
+      setTransferProgress(
+        batchTotal ? `Ricezione ${batchIndex + 1}/${batchTotal}: 0%` : 'Ricezione: 0%'
+      );
+      armStallWatchdog();
+      return;
+    }
+
+    if (typeof data.text === 'string') {
+      setMessages(prev => [...prev, { sender: data.sender, text: data.text }]);
+    }
   };
+};
 
   const sendMessageP2P = () => {
     if (dcRef.current && dcRef.current.readyState === 'open' && textInput) {
@@ -451,72 +410,75 @@ function AppContent() {
     }
   };
 
-  // FEAT: invia un singolo file sul canale dati, restituendo una Promise che si
-  // risolve a trasferimento completato. `batchInfo` (opzionale) marca il file
-  // come parte di un invio multiplo, cosicché il ricevente possa raggrupparlo
-  // con gli altri invece di mostrarlo come messaggio a sé.
+
+
+  // Valori pompati per saturare le reti moderne
+  const CHUNK_SIZE = 128 * 1024; // 128KB - Dimezza il carico sul processore
+  const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - Riempiamo bene il tubo prima di fermarci
+  const LOW_WATER_MARK = 1 * 1024 * 1024; // 1MB - Riprendiamo a pompare senza far svuotare il tubo
+
   const sendSingleFileAsync = (file, batchInfo) => {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => { // Aggiunto 'async'
+      const dc = dcRef.current;
+
       const metaData = JSON.stringify({
         type: 'file-meta',
         sender: userName || 'Io',
         name: file.name,
         size: file.size,
-        ...(batchInfo ? {
-          batchId: batchInfo.batchId,
-          batchIndex: batchInfo.batchIndex,
-          batchTotal: batchInfo.batchTotal
-        } : {})
+        ...(batchInfo ? { batchId: batchInfo.batchId, batchIndex: batchInfo.batchIndex, batchTotal: batchInfo.batchTotal } : {})
       });
-      dcRef.current.send(metaData);
+      dc.send(metaData);
 
-      const chunkSize = 16384; // Limite iOS: 16KB massimi per pacchetto
+      dc.bufferedAmountLowThreshold = LOW_WATER_MARK;
+
       let offset = 0;
       let lastReported = 0;
 
       armStallWatchdog();
 
-      const readNextChunk = () => {
-        if (dcRef.current.bufferedAmount > 65536) {
-          setTimeout(readNextChunk, 50);
-          return;
-        }
-
-        const slice = file.slice(offset, offset + chunkSize);
-        const fileReader = new FileReader();
-
-        fileReader.onload = (e) => {
-          try {
-            const base64Chunk = arrayBufferToBase64(e.target.result);
-            dcRef.current.send(JSON.stringify({ type: 'file-chunk', data: base64Chunk }));
-            offset += e.target.result.byteLength;
-
-            const progress = Math.round((offset / file.size) * 100);
-            if (progress > lastReported) {
-              lastReported = progress;
-              setTransferProgress(
-                batchInfo ? `Invio ${batchInfo.batchIndex + 1}/${batchInfo.batchTotal}: ${progress}%` : `Invio: ${progress}%`
-              );
-              armStallWatchdog();
-            }
-
-            if (offset < file.size) {
-              readNextChunk();
-            } else {
-              resolve();
-            }
-          } catch (error) {
-            reject(error);
+      try {
+        // Usiamo un ciclo "while" fluido invece di ricorsione e FileReader
+        while (offset < file.size) {
+          
+          // BACKPRESSURE: Se il tubo è pieno, mettiamo in pausa istantaneamente
+          if (dc.bufferedAmount > HIGH_WATER_MARK) {
+            await new Promise(r => {
+              dc.onbufferedamountlow = () => {
+                dc.onbufferedamountlow = null;
+                r(); // Il tubo si è liberato, sblocca l'await e riparti
+              };
+            });
           }
-        };
 
-        fileReader.onerror = () => reject(fileReader.error || new Error('Errore di lettura del file'));
-        fileReader.readAsArrayBuffer(slice);
-      };
+          // LETTURA FULMINEA (No FileReader)
+          const slice = file.slice(offset, offset + CHUNK_SIZE);
+          const buffer = await slice.arrayBuffer(); 
 
-      setTimeout(readNextChunk, 100);
+          // INVIO DIRETTO
+          dc.send(buffer);
+          offset += buffer.byteLength;
+
+          // PROGRESSO (Senza rallentare l'invio)
+          const progress = Math.round((offset / file.size) * 100);
+          if (progress > lastReported) {
+            lastReported = progress;
+            setTransferProgress(
+              batchInfo ? `Invio ${batchInfo.batchIndex + 1}/${batchInfo.batchTotal}: ${progress}%` : `Invio: ${progress}%`
+            );
+            armStallWatchdog();
+          }
+        }
+        
+        resolve(); // Fine del file!
+        
+      } catch (error) {
+        console.error("Errore durante l'invio del file:", error);
+        reject(error);
+      }
     });
   };
+
 
   const handleFileUpload = async (event) => {
     const files = Array.from(event.target.files || []);
