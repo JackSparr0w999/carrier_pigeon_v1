@@ -54,5 +54,6 @@ on run {input, parameters}
 end run
 ```
 
-**Opzione 2**. _Carica tutto su Render.com e crea gratuitamente un link pubblico a chiunque_
+**Opzione 2**. _Carica tutto su Render.com e crea gratuitamente un link pubblico e accessibile a chiunque_
+
 In questo modo potrai condividere file da un device all'altro anche se essi sono distanti migliaia di chilometri.
