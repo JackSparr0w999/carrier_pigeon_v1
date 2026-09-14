@@ -412,13 +412,12 @@ function AppContent() {
 
 
 
-  // Valori pompati per saturare le reti moderne
-  const CHUNK_SIZE = 128 * 1024; // 128KB - Dimezza il carico sul processore
-  const HIGH_WATER_MARK = 4 * 1024 * 1024; // 4MB - Riempiamo bene il tubo prima di fermarci
-  const LOW_WATER_MARK = 1 * 1024 * 1024; // 1MB - Riprendiamo a pompare senza far svuotare il tubo
+  const CHUNK_SIZE = 65536; // 64KB — 4x il chunk precedente, senza il costo del base64
+  const HIGH_WATER_MARK = 1 * 1024 * 1024; // ci fermiamo se il buffer supera 1MB
+  const LOW_WATER_MARK = 256 * 1024; // ripartiamo quando scende sotto questa soglia
 
   const sendSingleFileAsync = (file, batchInfo) => {
-    return new Promise(async (resolve, reject) => { // Aggiunto 'async'
+    return new Promise((resolve, reject) => {
       const dc = dcRef.current;
 
       const metaData = JSON.stringify({
@@ -437,104 +436,110 @@ function AppContent() {
 
       armStallWatchdog();
 
+      const sendNextChunk = () => {
+        // FIX VELOCITÀ: invece di un timer che ricontrolla ogni 50ms, aspettiamo
+        // l'evento del browser che dice "il buffer si è liberato" — reagiamo
+        // subito, senza tempo sprecato.
+        if (dc.bufferedAmount > HIGH_WATER_MARK) {
+          dc.onbufferedamountlow = () => {
+            dc.onbufferedamountlow = null;
+            sendNextChunk();
+          };
+          return;
+        }
+
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const fileReader = new FileReader();
+
+        fileReader.onload = (e) => {
+          try {
+            // FIX VELOCITÀ: ArrayBuffer diretto, niente più base64/JSON per i chunk.
+            dc.send(e.target.result);
+            offset += e.target.result.byteLength;
+
+            const progress = Math.round((offset / file.size) * 100);
+            if (progress > lastReported) {
+              lastReported = progress;
+              setTransferProgress(
+                batchInfo ? `Invio ${batchInfo.batchIndex + 1}/${batchInfo.batchTotal}: ${progress}%` : `Invio: ${progress}%`
+              );
+              armStallWatchdog();
+            }
+
+            if (offset < file.size) {
+              sendNextChunk();
+            } else {
+              resolve();
+            }
+          } catch (error) {
+            reject(error);
+          }
+        };
+
+        fileReader.onerror = () => reject(fileReader.error || new Error('Errore di lettura del file'));
+        fileReader.readAsArrayBuffer(slice);
+      };
+
+      sendNextChunk(); // FIX VELOCITÀ: via subito, niente più delay artificiale di 100ms
+    });
+  };
+
+
+    const handleFileUpload = async (event) => {
+      const files = Array.from(event.target.files || []);
+      event.target.value = ''; // reset subito l'input, come prima
+
+      if (files.length === 0 || !dcRef.current || dcRef.current.readyState !== 'open') return;
+
+      for (const f of files) {
+        if (f.size > MAX_FILE_SIZE) {
+          alert(`"${f.name}" è troppo grande (max ${(MAX_FILE_SIZE / (1024 * 1024 * 1024)).toFixed(1)} GB).`);
+          return;
+        }
+      }
+
       try {
-        // Usiamo un ciclo "while" fluido invece di ricorsione e FileReader
-        while (offset < file.size) {
-          
-          // BACKPRESSURE: Se il tubo è pieno, mettiamo in pausa istantaneamente
-          if (dc.bufferedAmount > HIGH_WATER_MARK) {
-            await new Promise(r => {
-              dc.onbufferedamountlow = () => {
-                dc.onbufferedamountlow = null;
-                r(); // Il tubo si è liberato, sblocca l'await e riparti
-              };
-            });
+        if (files.length === 1) {
+          // Comportamento invariato per il file singolo.
+          await sendSingleFileAsync(files[0], null);
+          resetTransferState();
+          setMessages(prev => [...prev, { sender: 'Io', text: `Sent with my pigeon: ${files[0].name}` }]);
+        } else {
+          // FEAT: più file selezionati insieme -> stesso batchId per tutti,
+          // inviati in sequenza (uno alla volta, mai in parallelo sullo stesso
+          // canale) e riassunti in UN SOLO messaggio lato mittente.
+          const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+          const names = [];
+          for (let i = 0; i < files.length; i++) {
+            await sendSingleFileAsync(files[i], { batchId, batchIndex: i, batchTotal: files.length });
+            names.push(files[i].name);
           }
-
-          // LETTURA FULMINEA (No FileReader)
-          const slice = file.slice(offset, offset + CHUNK_SIZE);
-          const buffer = await slice.arrayBuffer(); 
-
-          // INVIO DIRETTO
-          dc.send(buffer);
-          offset += buffer.byteLength;
-
-          // PROGRESSO (Senza rallentare l'invio)
-          const progress = Math.round((offset / file.size) * 100);
-          if (progress > lastReported) {
-            lastReported = progress;
-            setTransferProgress(
-              batchInfo ? `Invio ${batchInfo.batchIndex + 1}/${batchInfo.batchTotal}: ${progress}%` : `Invio: ${progress}%`
-            );
-            armStallWatchdog();
-          }
+          resetTransferState();
+          setMessages(prev => [...prev, { sender: 'Io', text: `Sent with my pigeons: ${names.join(', ')}` }]);
         }
-        
-        resolve(); // Fine del file!
-        
       } catch (error) {
-        console.error("Errore durante l'invio del file:", error);
-        reject(error);
-      }
-    });
-  };
-
-
-  const handleFileUpload = async (event) => {
-    const files = Array.from(event.target.files || []);
-    event.target.value = ''; // reset subito l'input, come prima
-
-    if (files.length === 0 || !dcRef.current || dcRef.current.readyState !== 'open') return;
-
-    for (const f of files) {
-      if (f.size > MAX_FILE_SIZE) {
-        alert(`"${f.name}" è troppo grande (max ${(MAX_FILE_SIZE / (1024 * 1024 * 1024)).toFixed(1)} GB).`);
-        return;
-      }
-    }
-
-    try {
-      if (files.length === 1) {
-        // Comportamento invariato per il file singolo.
-        await sendSingleFileAsync(files[0], null);
+        console.error("Errore tunnel P2P:", error);
         resetTransferState();
-        setMessages(prev => [...prev, { sender: 'Io', text: `Sent with my pigeon: ${files[0].name}` }]);
-      } else {
-        // FEAT: più file selezionati insieme -> stesso batchId per tutti,
-        // inviati in sequenza (uno alla volta, mai in parallelo sullo stesso
-        // canale) e riassunti in UN SOLO messaggio lato mittente.
-        const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-        const names = [];
-        for (let i = 0; i < files.length; i++) {
-          await sendSingleFileAsync(files[i], { batchId, batchIndex: i, batchTotal: files.length });
-          names.push(files[i].name);
-        }
-        resetTransferState();
-        setMessages(prev => [...prev, { sender: 'Io', text: `Sent with my pigeons: ${names.join(', ')}` }]);
+        alert("Errore durante l'invio. Riprova.");
       }
-    } catch (error) {
-      console.error("Errore tunnel P2P:", error);
-      resetTransferState();
-      alert("Errore durante l'invio. Riprova.");
-    }
-  };
+    };
 
-  // FEAT: scarica in sequenza tutti i file di un messaggio raggruppato.
-  // Nota: un sito web non può "aprire una cartella" sul dispositivo — questo
-  // è il massimo che il browser permette, ovvero avviare il download di
-  // ciascun file uno dopo l'altro.
-  const downloadAllFiles = (files) => {
-    files.forEach((f, i) => {
-      setTimeout(() => {
-        const a = document.createElement('a');
-        a.href = f.url;
-        a.download = f.name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }, i * 300); // piccolo scaglionamento per evitare che il browser blocchi download multipli simultanei
-    });
-  };
+    // FEAT: scarica in sequenza tutti i file di un messaggio raggruppato.
+    // Nota: un sito web non può "aprire una cartella" sul dispositivo — questo
+    // è il massimo che il browser permette, ovvero avviare il download di
+    // ciascun file uno dopo l'altro.
+    const downloadAllFiles = (files) => {
+      files.forEach((f, i) => {
+        setTimeout(() => {
+          const a = document.createElement('a');
+          a.href = f.url;
+          a.download = f.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }, i * 300); // piccolo scaglionamento per evitare che il browser blocchi download multipli simultanei
+      });
+    };
 
   // FEAT: crea un messaggio locale con la tabella completa (Nome/Download/Dimensione)
   // di tutti i file di un batch — usato dal pulsante "Get info" quando ci sono
