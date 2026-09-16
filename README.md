@@ -19,9 +19,9 @@ automatically erasing the room and its contents after a predefined period of tim
 ### How to use it
 **0. In locale**. _Con Visual Studio Code._
 
-E' sufficiente entrare nella cartella backend da terminale e scrivere: `node server.js`
+E' sufficiente entrare nella cartella frontend da terminale e scrivere: `npm install` e poi  `npm run dev`
 
-Poi aprire un altro terminale, andare nella cartella frontend e scrivere: `npm run dev — —host`.
+Poi aprire un altro terminale, andare nella cartella backend e scrivere:`npm install` e poi `node server.js`.
 
 Fatto questo, sarà possibile vedere il link condivisibile da tutti i device, purché connessi alla stessa rete.
 
